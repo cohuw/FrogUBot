@@ -74,6 +74,15 @@ def _as_number(value: Any) -> float | None:
         return None
 
 
+import functools
+
+@functools.lru_cache(maxsize=1024)
+def _compile_regex(pattern: str):
+    try:
+        return re.compile(pattern)
+    except re.error:
+        return None
+
 def condition_matches(condition: dict[str, Any], context: dict[str, Any]) -> tuple[bool, dict[str, str]]:
     target, op = condition.get("target", ""), condition.get("match_type", "")
     actual, expected = _value(context, target), condition.get("pattern", "")
@@ -85,7 +94,8 @@ def condition_matches(condition: dict[str, Any], context: dict[str, Any]) -> tup
     if op in {"has_media", "is_reply", "is_forward", "is_admin", "is_owner"}:
         return bool(actual) == (str(expected).lower() not in {"0", "false", "no"}), captures
     if op == "regex":
-        match = re.search(str(expected), str(actual or ""))
+        pattern = _compile_regex(str(expected))
+        match = pattern.search(str(actual or "")) if pattern else None
         if match:
             captures.update({k: v for k, v in match.groupdict().items() if v is not None})
         return bool(match), captures

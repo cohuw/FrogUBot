@@ -13,6 +13,7 @@ if str(ROOT_DIR) not in sys.path:
 
 from pyrogram import Client, filters
 from pyrogram.types import Message
+from pyrogram.errors import FloodWait
 from .macro.engine import test_macro, trigger_matches
 
 CONFIG_FILE = Path.home() / ".frogubot.json"
@@ -75,18 +76,49 @@ async def report_run(macro_id: str, status: str, duration_ms: float, error: str 
         except Exception as e:
             print(f"Failed to report run: {e}")
 
-async def execute_action(client: Client, message: Message, action: dict):
+def get_safe_globals():
+    return {
+        "__builtins__": {
+            "print": print, "len": len, "range": range, "str": str, "int": int, "float": float,
+            "bool": bool, "list": list, "dict": dict, "set": set, "tuple": tuple,
+            "enumerate": enumerate, "zip": zip, "sum": sum, "min": min, "max": max,
+            "abs": abs, "round": round, "any": any, "all": all, "isinstance": isinstance,
+            "Exception": Exception, "ValueError": ValueError, "TypeError": TypeError,
+        },
+        "re": __import__("re"),
+        "json": __import__("json"),
+        "math": __import__("math"),
+        "time": __import__("time"),
+        "random": __import__("random"),
+        "datetime": __import__("datetime"),
+        "asyncio": __import__("asyncio"),
+    }
+
+async def execute_python_code(client: Client, message: Message, code: str, context: dict):
+    wrapper = "async def __macro_run(client, message, context):\n"
+    for line in code.splitlines():
+        wrapper += f"    {line}\n"
+    if not code.strip():
+        wrapper += "    pass\n"
+
+    safe_globals = get_safe_globals()
+    exec(wrapper, safe_globals)
+    func = safe_globals["__macro_run"]
+    await func(client, message, context)
+
+
+async def execute_action(client: Client, message: Message, action: dict, context: dict):
     a_type = action.get("type")
     if a_type == "reply":
         await message.reply_text(action.get("text", ""))
     elif a_type == "send_message":
-        chat_id = action.get("chat_id")
+        chat_id = action.get("target_chat") or action.get("chat_id")
         if not chat_id: chat_id = message.chat.id
         await client.send_message(chat_id, action.get("text", ""))
-    elif a_type == "delete_message":
+    elif a_type == "delete" or a_type == "delete_message":
         await message.delete()
-    elif a_type == "forward_message":
-        chat_id = action.get("chat_id")
+    elif a_type == "forward" or a_type == "forward_message":
+        chat_id = action.get("target_chat") or action.get("chat_id")
         if not chat_id: chat_id = message.chat.id
         await message.forward(chat_id)
     elif a_type == "api_request":
@@ -96,9 +128,13 @@ async def execute_action(client: Client, message: Message, action: dict):
                 await http_client.request(
                     method=action.get("method", "GET"),
                     url=url,
-                    json=action.get("payload")
+                    json=action.get("body_json") or action.get("payload")
                 )
-    # run_python is skipped due to security restrictions as requested
+    elif a_type == "run_python":
+        code = action.get("code", "")
+        await execute_python_code(client, message, code, context)
+    elif a_type == "set_variable":
+        pass  # Handled in engine
     else:
         print(f"Unknown action type: {a_type}")
 
@@ -140,6 +176,34 @@ async def manual_sync_command(client: Client, message: Message):
     await sync_macros()
     await message.edit_text(f"✅ Успешно загружено {len(macros_cache)} макросов!")
     
+async def run_macro_task(client: Client, message: Message, macro: dict, event_dict: dict):
+    start_time = time.time()
+    try:
+        result = test_macro(macro, event_dict)
+        if not result.matched:
+            return
+
+        async def _execute_all():
+            for action in result.actions:
+                await execute_action(client, message, action, result.context)
+        
+        # Таймаут макроса 30 секунд, чтобы не вешал бота
+        await asyncio.wait_for(_execute_all(), timeout=30.0)
+        
+        duration = (time.time() - start_time) * 1000
+        asyncio.create_task(report_run(macro.get("id", ""), "success", duration))
+
+    except asyncio.TimeoutError:
+        duration = (time.time() - start_time) * 1000
+        asyncio.create_task(report_run(macro.get("id", ""), "error", duration, "Execution timeout (30s)"))
+    except FloodWait as e:
+        duration = (time.time() - start_time) * 1000
+        asyncio.create_task(report_run(macro.get("id", ""), "error", duration, f"FloodWait: {e.value}s"))
+    except Exception as e:
+        duration = (time.time() - start_time) * 1000
+        asyncio.create_task(report_run(macro.get("id", ""), "error", duration, str(e)))
+
+
 @app.on_message(~filters.me)
 async def handle_message(client: Client, message: Message):
     if not macros_cache:
@@ -151,28 +215,8 @@ async def handle_message(client: Client, message: Message):
         if not row.get("enabled", True): continue
         macro = row.get("payload", {})
         
-        start_time = time.time()
-        try:
-            result = test_macro(macro, event_dict)
-            print(f"Testing macro '{macro.get('name')}' against message '{message.text}': matched={result.matched}")
-            if not result.matched:
-                if result.errors:
-                    print(f"  Errors: {result.errors}")
-                # Print why it failed matching
-                print(f"  Trigger matched: {trigger_matches(macro, result.context)}")
-                if trigger_matches(macro, result.context):
-                    print(f"  Conditions: {result.conditions}")
-            
-            if result.matched:
-                print(f"Macro matched: {macro.get('name', macro.get('id'))}")
-                for action in result.actions:
-                    await execute_action(client, message, action)
-                duration = (time.time() - start_time) * 1000
-                asyncio.create_task(report_run(macro.get("id", ""), "success", duration))
-                break # Stop processing other macros for this event if one matches
-        except Exception as e:
-            duration = (time.time() - start_time) * 1000
-            asyncio.create_task(report_run(macro.get("id", ""), "error", duration, str(e)))
+        # Каждый макрос крутится параллельно в своей задаче
+        asyncio.create_task(run_macro_task(client, message, macro, event_dict))
 
 def main():
     print("Starting FrogUBot Client (Kurigram)...")
